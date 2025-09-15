@@ -1,2 +1,5 @@
 # Realtime_PC_STATS
 Using a Lilygo T-Display s3 to update status of PC by serial connection.
+
+Once the code is burned on the top device, you will need to run the FEEDER.PY script to get data to flow and show CPU /MEMORY / GPU usage.
+You will need to know the COM ports as this will have to updated in the FEEDER.PY.
