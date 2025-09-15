@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
+#include <string.h>
 
 // --- Use LilyGO's pin_config.h if present ---
 #if __has_include("pin_config.h")
@@ -27,7 +28,6 @@ TFT_eSPI tft;  // Uses your TFT_eSPI Setup206 mapping
 #define COL_CPU    TFT_CYAN
 #define COL_MEM    TFT_ORANGE
 #define COL_GPU    TFT_GREEN
-#define COL_DISK   TFT_MAGENTA
 #define COL_SPARK  TFT_DARKGREEN   // sparkline color; tweak per metric if you like
 
 // ---------- Layout ----------
@@ -42,7 +42,7 @@ static const int BAR_GAP   = 8;
 static const int BARS_TOP  = 44;  // area starts below title + rule
 
 // Total per metric block = BAR_H + 2 + SPARK_H + BAR_GAP
-// With 4 metrics this fits in 170px height.
+// With 3 metrics this fits comfortably in 170px height.
 
 // ---------- Animation / History ----------
 static const float   EASE_ALPHA = 0.20f;   // smoothing toward target
@@ -51,17 +51,15 @@ static const int     HIST_LEN   = 64;      // points per sparkline
 static const uint32_t HIST_PUSH_EVERY_MS = 200; // sample history 5 Hz
 
 // Targets from feeder
-static float tgtCPU=0, tgtMEM=0, tgtGPU=0, tgtDSK=0;
-static float tgtDiskMBps = -1.0f;  // <0 means "not provided"
+static float tgtCPU=0, tgtMEM=0, tgtGPU=0;
 
 // Animated currents
-static float curCPU=0, curMEM=0, curGPU=0, curDSK=0;
+static float curCPU=0, curMEM=0, curGPU=0;
 
 // History buffers
 static float histCPU[HIST_LEN] = {0};
 static float histMEM[HIST_LEN] = {0};
 static float histGPU[HIST_LEN] = {0};
-static float histDSK[HIST_LEN] = {0};
 static int   histIndex = 0;
 static uint32_t nextHistPushAt = 0;
 
@@ -82,7 +80,7 @@ static void drawHeader() {
   tft.drawString("RealTime PC Stats", MARGIN, TITLE_Y, 4);
   tft.drawFastHLine(0, 36, W, COL_FRAME);
   tft.setTextFont(2);
-  tft.drawString("Send: cpu,mem,gpu,disk%[,diskMB/s] @115200", MARGIN, 38);
+  tft.drawString("Send: cpu,mem,gpu @115200", MARGIN, 38);
 }
 
 // Draw the filled bar and its label/value
@@ -104,7 +102,7 @@ static void drawBar(int y, int pct, uint16_t color, const char* label, const cha
   tft.setTextColor(COL_TEXT, COL_BG);
   tft.drawString(buf, x + 6, y + BAR_H/2, 2);
 
-  // optional right-side hint (e.g. "123.4 MB/s")
+  // optional right-side hint (e.g. a temperature reading)
   if (rightHint && rightHint[0]) {
     tft.setTextDatum(MR_DATUM);
     tft.drawString(rightHint, x + w - 6, y + BAR_H/2, 2);
@@ -150,7 +148,7 @@ static void drawSparkline(int x, int y, int w, int h, const float* hist, uint16_
   }
 }
 
-static void drawAll(int cpu, int mem, int gpu, int dsk, float diskMBps) {
+static void drawAll(int cpu, int mem, int gpu) {
   // Clear the metric area below the rule
   tft.fillRect(0, 36, W, H - 36, COL_BG);
 
@@ -169,13 +167,6 @@ static void drawAll(int cpu, int mem, int gpu, int dsk, float diskMBps) {
   // GPU
   drawBar(y, gpu, COL_GPU, "GPU");
   drawSparkline(MARGIN, y + BAR_H + 2, W - MARGIN*2, SPARK_H, histGPU, COL_SPARK);
-  y += BAR_H + 2 + SPARK_H + BAR_GAP;
-
-  // DISK (with optional MB/s hint)
-  char hint[24] = {0};
-  if (diskMBps >= 0.0f) snprintf(hint, sizeof(hint), "%.1f MB/s", diskMBps);
-  drawBar(y, dsk, COL_DISK, "DISK", (diskMBps >= 0.0f) ? hint : nullptr);
-  drawSparkline(MARGIN, y + BAR_H + 2, W - MARGIN*2, SPARK_H, histDSK, COL_SPARK);
 }
 
 static void pushHistoryIfDue() {
@@ -187,7 +178,6 @@ static void pushHistoryIfDue() {
   histCPU[histIndex] = clamp100f(curCPU);
   histMEM[histIndex] = clamp100f(curMEM);
   histGPU[histIndex] = clamp100f(curGPU);
-  histDSK[histIndex] = clamp100f(curDSK);
   histIndex = (histIndex + 1) % HIST_LEN;
 }
 
@@ -200,42 +190,40 @@ static void animateAndDrawIfDue() {
   curCPU += (tgtCPU - curCPU) * EASE_ALPHA;
   curMEM += (tgtMEM - curMEM) * EASE_ALPHA;
   curGPU += (tgtGPU - curGPU) * EASE_ALPHA;
-  curDSK += (tgtDSK - curDSK) * EASE_ALPHA;
 
   // Periodically push to history
   pushHistoryIfDue();
 
   // Redraw only if bars changed visibly (save work)
-  static int lastC=-1, lastM=-1, lastG=-1, lastD=-1;
+  static int lastC=-1, lastM=-1, lastG=-1;
   int C = clamp100f(curCPU);
   int M = clamp100f(curMEM);
   int G = clamp100f(curGPU);
-  int D = clamp100f(curDSK);
 
-  if (C != lastC || M != lastM || G != lastG || D != lastD) {
-    drawAll(C, M, G, D, tgtDiskMBps);
-    lastC=C; lastM=M; lastG=G; lastD=D;
+  if (C != lastC || M != lastM || G != lastG) {
+    drawAll(C, M, G);
+    lastC=C; lastM=M; lastG=G;
   }
 }
 
-// Parse lines like: cpu,mem,gpu,diskPct[,diskMBps]
+// Parse lines like: cpu,mem,gpu
 static void parseLine(char* s) {
-  const int MAXTOK = 5;
+  const int MAXTOK = 3;
   char* tok[MAXTOK] = {0};
   int ntok = 0;
 
-  // split by commas (in-place)
-  for (char* p = s; *p && ntok < MAXTOK; ++p) {
-    if (ntok == 0) tok[ntok++] = p;
-    if (*p == ',') { *p = 0; if (*(p+1)) tok[ntok++] = p+1; }
+  if (!s) return;
+
+  char* part = strtok(s, ",");
+  while (part && ntok < MAXTOK) {
+    tok[ntok++] = part;
+    part = strtok(nullptr, ",");
   }
 
-  if (ntok >= 4) {
+  if (ntok >= 3) {
     tgtCPU = atof(tok[0]);
     tgtMEM = atof(tok[1]);
     tgtGPU = atof(tok[2]);
-    tgtDSK = atof(tok[3]);
-    tgtDiskMBps = (ntok >= 5) ? atof(tok[4]) : -1.0f;
   }
 }
 
