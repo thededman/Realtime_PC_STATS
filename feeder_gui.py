@@ -44,7 +44,7 @@ else:
     WIN_CREATE_NO_WINDOW = 0
     _HIDDEN_SI = None
 
-def _run_nvidia_smi_hidden(args, timeout=0.5) -> str:
+def _run_nvidia_smi_hidden(args, timeout=0.6) -> str:
     """Run nvidia-smi with no flashing console and return stdout (str)."""
     return subprocess.check_output(
         args,
@@ -55,9 +55,54 @@ def _run_nvidia_smi_hidden(args, timeout=0.5) -> str:
         creationflags=WIN_CREATE_NO_WINDOW,
     ).decode("ascii", errors="ignore").strip()
 
+def _b2s(x):
+    return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+def _list_gpu_names_with_index() -> list[str]:
+    """
+    Return a list like ["0: NVIDIA GeForce RTX 3080", "1: NVIDIA RTX A2000"]
+    Try NVML first; if unavailable, fall back to nvidia-smi; else default to ["0: GPU0"].
+    """
+    # NVML path
+    if HAVE_NVML:
+        try:
+            pynvml.nvmlInit()
+            count = pynvml.nvmlDeviceGetCount()
+            names = []
+            for i in range(count):
+                h = pynvml.nvmlDeviceGetHandleByIndex(i)
+                nm = pynvml.nvmlDeviceGetName(h)
+                names.append(f"{i}: {_b2s(nm)}")
+            pynvml.nvmlShutdown()
+            if names:
+                return names
+        except Exception:
+            # fall through to nvidia-smi
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+
+    # nvidia-smi path
+    smi = shutil.which("nvidia-smi")
+    if smi:
+        try:
+            out = _run_nvidia_smi_hidden(
+                [smi, "--query-gpu=name", "--format=csv,noheader"]
+            )
+            lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            if lines:
+                return [f"{i}: {lines[i]}" for i in range(len(lines))]
+        except Exception:
+            pass
+
+    # default single entry
+    return ["0: GPU0"]
+
 class FeederThread(threading.Thread):
     def __init__(self, port_getter, baud_getter, gpu_enabled_getter,
-                 disk_scale_getter, drives_getter, log_func, on_disconnect):
+                 disk_scale_getter, drives_getter, log_func, on_disconnect,
+                 gpu_index_getter):
         super().__init__(daemon=True)
         self._stop = threading.Event()
         self.serial = None
@@ -68,6 +113,7 @@ class FeederThread(threading.Thread):
         self.drives_getter = drives_getter
         self.log = log_func
         self.on_disconnect = on_disconnect
+        self.gpu_index_getter = gpu_index_getter
 
         self.last_disk = psutil.disk_io_counters()
         self.last_time = time.time()
@@ -91,21 +137,22 @@ class FeederThread(threading.Thread):
 
         # --- GPU init: NVML → fallback to nvidia-smi ---
         if self.gpu_enabled_getter():
+            idx = int(self.gpu_index_getter())
             if HAVE_NVML:
                 try:
-                    # If your system needs an explicit DLL dir, uncomment and adjust:
+                    # If your system needs an explicit DLL dir, uncomment:
                     # os.add_dll_directory(r"C:\Program Files\NVIDIA Corporation\NVSMI")
                     pynvml.nvmlInit()
-                    self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
                     self.nvml_ok = True
-                    self.log("NVML initialized (GPU 0).")
+                    self.log(f"NVML initialized (GPU {idx}).")
                 except Exception as e:
                     self.log(f"NVML init failed: {e}")
                     self.nvml_ok = False
             if not self.nvml_ok:
                 if self.smi_path:
                     self.smi_ok = True
-                    self.log(f"Using nvidia-smi fallback: {self.smi_path}")
+                    self.log(f"Using nvidia-smi fallback (GPU {idx}): {self.smi_path}")
                 else:
                     self.log("GPU fallback disabled: nvidia-smi not found in PATH.")
 
@@ -149,6 +196,7 @@ class FeederThread(threading.Thread):
                 gpu = 0.0
                 gpu_temp_f = -999.0
                 if self.gpu_enabled_getter():
+                    idx = int(self.gpu_index_getter())
                     if self.nvml_ok:
                         try:
                             util = pynvml.nvmlDeviceGetUtilizationRates(self.nvml_handle)
@@ -163,9 +211,10 @@ class FeederThread(threading.Thread):
                         try:
                             out = _run_nvidia_smi_hidden(
                                 [self.smi_path,
+                                 f"--id={idx}",
                                  "--query-gpu=utilization.gpu,temperature.gpu",
                                  "--format=csv,noheader,nounits"],
-                                timeout=0.5
+                                timeout=0.6
                             )
                             # Example: "12, 45"
                             parts = out.split(",")
@@ -200,8 +249,10 @@ class FeederThread(threading.Thread):
 
                 # Update status line in GUI
                 self.log(
-                    f"CPU {cpu:.0f}%  MEM {mem:.0f}%  GPU {gpu:.0f}%  DISK {disk_pct:.0f}% ({mbps:.1f} MB/s)  "
-                    f"CPUt {cpu_temp_f:.0f}F  GPUt {gpu_temp_f:.0f}F  C: {freeC:.0f} GB  D: {freeD:.0f} GB",
+                    f"CPU {cpu:.0f}%  MEM {mem:.0f}%  GPU {gpu:.0f}% (GPU{int(self.gpu_index_getter())})  "
+                    f"DISK {disk_pct:.0f}% ({mbps:.1f} MB/s)  "
+                    f"CPUt {cpu_temp_f:.0f}F  GPUt {gpu_temp_f:.0f}F  "
+                    f"C: {freeC:.0f} GB  D: {freeD:.0f} GB",
                     replace_line=True
                 )
 
@@ -272,18 +323,25 @@ class App(tk.Tk):
         # Row 1: GPU enable + disk scale + drives
         self.gpu_var = tk.BooleanVar(value=True)
         self.gpu_chk = ttk.Checkbutton(frm, text="Enable GPU (NVML or nvidia-smi fallback)", variable=self.gpu_var)
-        self.gpu_chk.grid(column=0, row=1, columnspan=3, sticky="w", pady=(8, 0))
+        self.gpu_chk.grid(column=0, row=1, columnspan=2, sticky="w", pady=(8, 0))
 
-        ttk.Label(frm, text="Disk 100% =").grid(column=3, row=1, sticky="e", padx=(10, 2), pady=(8, 0))
+        ttk.Label(frm, text="Disk 100% =").grid(column=2, row=1, sticky="e", padx=(10, 2), pady=(8, 0))
         self.disk_scale = tk.DoubleVar(value=200.0)  # MB/s that maps to 100%
         self.disk_entry = ttk.Entry(frm, textvariable=self.disk_scale, width=7)
-        self.disk_entry.grid(column=4, row=1, sticky="w", pady=(8, 0))
-        ttk.Label(frm, text="MB/s").grid(column=4, row=1, sticky="e", padx=(60, 0), pady=(8, 0))
+        self.disk_entry.grid(column=3, row=1, sticky="w", pady=(8, 0))
+        ttk.Label(frm, text="MB/s").grid(column=4, row=1, sticky="w", pady=(8, 0))
 
         ttk.Label(frm, text="Drives (comma):").grid(column=0, row=2, sticky="w", pady=(8, 0))
         self.drives_var = tk.StringVar(value=",".join(DEFAULT_DRIVES))
         self.drives_entry = ttk.Entry(frm, textvariable=self.drives_var, width=18)
         self.drives_entry.grid(column=1, row=2, sticky="w", pady=(8, 0))
+
+        # Row 2 (right side): GPU picker with names
+        ttk.Label(frm, text="GPU:").grid(column=2, row=2, sticky="e", padx=(10, 4))
+        gpu_list = _list_gpu_names_with_index()
+        self.gpu_index_cmb = ttk.Combobox(frm, width=40, state="readonly", values=gpu_list)
+        self.gpu_index_cmb.grid(column=3, row=2, columnspan=2, sticky="w")
+        self.gpu_index_cmb.set(gpu_list[0])
 
         # Row 3: Connect / Disconnect
         self.connect_btn = ttk.Button(frm, text="Connect", command=self._connect)
@@ -338,6 +396,13 @@ class App(tk.Tk):
         parts = [x.strip().upper().rstrip(":") for x in s.split(",") if x.strip()]
         return parts or DEFAULT_DRIVES
 
+    def _get_gpu_index(self):
+        try:
+            # "0: NVIDIA GeForce ..." -> 0
+            return int(self.gpu_index_cmb.get().split(":")[0])
+        except Exception:
+            return 0
+
     def log(self, msg, replace_line=False):
         self.ui_queue.put((msg, replace_line))
 
@@ -375,7 +440,8 @@ class App(tk.Tk):
             disk_scale_getter=self._get_disk_scale,
             drives_getter=self._get_drives,
             log_func=self.log,
-            on_disconnect=self._on_thread_disconnected
+            on_disconnect=self._on_thread_disconnected,
+            gpu_index_getter=self._get_gpu_index
         )
         self.feeder.start()
 
