@@ -1,377 +1,411 @@
+// T-Display-S3 PC Monitor Dashboard + WiFi Web Server (Sprite Double-Buffered, ~30 FPS)
+// - Modes: CPU, GPU, DISK (cycle with right/left buttons)
+// - Smooth bar animations + 60-sample sparkline
+// - Parses CSV from feeder GUI (USB serial) at 115200:
+//   cpu,mem,gpu,diskPct,diskMBps,cpuTempF,gpuTempF,freeC_GB,freeD_GB\n
+// - WiFi server:
+//     GET /         -> live HTML dashboard (auto-refresh via JS)
+//     GET /metrics  -> JSON {cpu, mem, gpu, diskPct, diskMBps, cpuTempF, gpuTempF, freeC, freeD}
+//     GET /ip       -> plain text IP
+//
+// REQUIREMENTS:
+// - Arduino ESP32 core 2.0.x
+// - TFT_eSPI with Setup206_LilyGo_T_Display_S3 selected in User_Setup_Select.h
+// - In TFT_eSPI/User_Setup.h: #define LOAD_GFXFF (to use FreeFonts)
+// - No extra font headers needed; TFT_eSPI FreeFonts are referenced by symbol.
+// - Buttons: GPIO 0 = Back, GPIO 14 = Next (active LOW)
+// - LCD power: GPIO 15 (set HIGH)
+
 #include <Arduino.h>
 #include <TFT_eSPI.h>
 #include <SPI.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
-// If present, uses LilyGO's pin_config.h (power, BL, button pins, etc.)
-#if __has_include("pin_config.h")
-  #include "pin_config.h"
-#endif
+// ---------------------- WiFi CONFIG ----------------------
+// <<< EDIT THESE >>>
+const char* WIFI_SSID = "YourWifiName";
+const char* WIFI_PASS = "YourWifiPassword";
+// ---------------------------------------------------------
 
-// Fallback pins if pin_config.h isn't present
-#ifndef PIN_POWER_ON
-  #define PIN_POWER_ON 15
-#endif
-#ifndef PIN_LCD_BL
-  #define PIN_LCD_BL 38
-#endif
-#ifndef TFT_BACKLIGHT_ON
-  #define TFT_BACKLIGHT_ON HIGH
-#endif
-#ifndef PIN_BUTTON_1            // NEXT button
-  #define PIN_BUTTON_1 0        // BOOT on many T-Display-S3s
-#endif
-#ifndef PIN_BUTTON_2            // BACK button
-  #define PIN_BUTTON_2 14       // second side button on many units
-#endif
+// TFT and full-screen sprite for flicker-free rendering
+TFT_eSPI tft;
+TFT_eSprite gfx = TFT_eSprite(&tft);   // off-screen framebuffer (RGB565)
 
-TFT_eSPI tft;  // Uses your TFT_eSPI Setup206 mapping
+// Pins / IO
+static const int PIN_LCD_POWER = 15;
+static const int BTN_BACK  = 0;    // left/back (active LOW)
+static const int BTN_NEXT  = 14;   // right/next (active LOW)
 
-// ---------- Colors ----------
-#define COL_BG     TFT_BLACK
-#define COL_FRAME  TFT_DARKGREY
-#define COL_TEXT   TFT_WHITE
-#define COL_CPU    TFT_CYAN
-#define COL_GPU    TFT_GREEN
-#define COL_DISK   TFT_MAGENTA
-#define COL_SPARK  TFT_DARKGREEN
+// Serial
+static const unsigned long BAUD = 115200;
 
-// ---------- Layout ----------
+// Screen modes
+enum Mode { MODE_CPU = 0, MODE_GPU = 1, MODE_DISK = 2 };
+volatile Mode gMode = MODE_CPU;
+
+// Latest stats from feeder
+struct Stats {
+  float cpu = 0, mem = 0, gpu = 0;
+  float diskPct = 0, diskMBps = 0;
+  float cpuTempF = -999, gpuTempF = -999;
+  float freeC = -1, freeD = -1;
+} cur;
+
+// History buffers for sparkline (60 samples)
+static const int HIST_N = 60;
+float histCPU[HIST_N]  = {0};
+float histGPU[HIST_N]  = {0};
+float histDISK[HIST_N] = {0};
+int   histIdx = 0;
+
+// Bar animation
+float barTarget = 0.0f;   // 0..100
+float barValue  = 0.0f;   // 0..100 (displayed)
+uint32_t lastAnim = 0;
+
+// Debounce
+uint32_t lastBtnTime = 0;
+
+// Canvas (Landscape rotation)
 static const int W = 320;
 static const int H = 170;
-static const int MARGIN    = 8;
-static const int TITLE_Y   = 4;   // top-left Y for title
-static const int RULE_Y    = 40;  // separator line below title
 
-static const int BAR_H     = 22;
-static const int SPARK_H   = 12;
-static const int BAR_GAP   = 8;
-static const int BARS_TOP  = 52;  // content starts below title/rule
+// Colors
+uint16_t bg = TFT_BLACK;
+uint16_t fg = TFT_WHITE;
+uint16_t accent = TFT_CYAN;
 
-// ---------- Animation / History ----------
-static const float   EASE_ALPHA = 0.20f;   // smoothing toward target
-static const uint32_t FRAME_MS  = 33;      // ~30 FPS
-static const int     HIST_LEN   = 64;      // points per sparkline
-static const uint32_t HIST_PUSH_EVERY_MS = 200; // 5 Hz history
+// Web server
+WebServer server(80);
+String ipText = "WiFi…";
 
-// Targets from feeder
-static float tgtCPU=0, tgtMEM=0, tgtGPU=0, tgtDSK=0;
-static float tgtDiskMBps = -1.0f;  // optional (negative = not provided)
+// Forward decl
+void setBarTargetFromMode();
+void render();
 
-// Temps & free space (sent by feeder)
-static float cpuTempF = -999.0f;
-static float gpuTempF = -999.0f;
-static float freeC_GB = -1.0f;
-static float freeD_GB = -1.0f;
+// ------------------- Button helpers -------------------
+bool buttonPressed(int pin) {
+  if (digitalRead(pin) == LOW) {
+    uint32_t now = millis();
+    if (now - lastBtnTime > 220) {
+      lastBtnTime = now;
+      return true;
+    }
+  }
+  return false;
+}
+void nextMode() { gMode = (Mode)((gMode + 1) % 3); }
+void prevMode() { gMode = (Mode)((gMode + 2) % 3); }
 
-// Animated currents
-static float curCPU=0, curMEM=0, curGPU=0, curDSK=0;
+// ------------------- Animation -------------------
+void animateBar() {
+  uint32_t now = millis();
+  float dt = (now - lastAnim) / 1000.0f;
+  if (dt < 0) dt = 0;
+  if (dt > 0.05f) dt = 0.05f;
+  lastAnim = now;
 
-// History buffers
-static float histCPU[HIST_LEN] = {0};
-static float histMEM[HIST_LEN] = {0};
-static float histGPU[HIST_LEN] = {0};
-static float histDSK[HIST_LEN] = {0};
-static int   histIndex = 0;
-static uint32_t nextHistPushAt = 0;
-
-// Redraw pacing
-static uint32_t nextFrameAt = 0;
-
-// Page state: 0=CPU, 1=GPU, 2=DISK
-static int page = 0;
-
-// Button debounce
-static uint32_t btn1LastChange = 0, btn2LastChange = 0;
-static bool lastBtn1 = true, lastBtn2 = true;   // INPUT_PULLUP → released = HIGH
-static const uint32_t BTN_DEBOUNCE_MS = 80;
-
-// ---------- Helpers ----------
-static inline int clamp100f(float v) {
-  if (v < 0)   return 0;
-  if (v > 100) return 100;
-  return (int)v;
+  const float speed = 7.0f;  // easing speed
+  barValue += (barTarget - barValue) * (1.0f - expf(-speed * dt));
 }
 
-// Use TFT_eSPI’s built-in FreeFonts (LOAD_GFXFF must be enabled in User_Setup.h)
-static void useTitleFont() {
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setFreeFont(&FreeSansBold24pt7b);   // big title
-}
-static void useLabelFont() {
-  tft.setTextColor(COL_TEXT, COL_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.setFreeFont(&FreeSans12pt7b);       // labels/info
+// ------------------- Sparkline -------------------
+void drawSparkline(int x, int y, int w, int h, const float *hist) {
+  gfx.fillRect(x, y, w, h, bg);
+
+  float mn =  1e9, mx = -1e9;
+  for (int i = 0; i < HIST_N; ++i) {
+    float v = hist[i];
+    if (v < mn) mn = v;
+    if (v > mx) mx = v;
+  }
+  if (mx <= mn) mx = mn + 1.0f;
+
+  int px = x, py = y + h - 1;
+  for (int i = 0; i < HIST_N; ++i) {
+    int idx = (histIdx + i) % HIST_N;
+    float v = hist[idx];
+    float norm = (v - mn) / (mx - mn);   // 0..1
+    int yy = y + h - 1 - int(norm * (h - 1));
+    int xx = x + (i * (w - 1)) / (HIST_N - 1);
+    if (i > 0) gfx.drawLine(px, py, xx, yy, accent);
+    px = xx; py = yy;
+  }
 }
 
-static void drawHeader() {
-  tft.fillScreen(COL_BG);
+// ------------------- Formatting -------------------
+String fmtPct(float v) {
+  if (v < 0) return "N/A";
+  char b[16]; snprintf(b, sizeof(b), "%.0f%%", v); return String(b);
+}
+String fmtTempF(float v) {
+  if (v < -100) return "—";
+  char b[16]; snprintf(b, sizeof(b), "%.0f°F", v); return String(b);
+}
+String fmtMBps(float v) {
+  char b[16]; snprintf(b, sizeof(b), "%.1f MB/s", v); return String(b);
+}
+String fmtGB(float v) {
+  if (v < 0) return "N/A";
+  char b[16]; snprintf(b, sizeof(b), "%.0f GB", v); return String(b);
+}
+
+// ------------------- Draw a frame into the sprite -------------------
+void drawBar(const char* title, float valuePct, const char* valueText) {
+  gfx.fillSprite(bg);
 
   // Title
-  useTitleFont();
-  tft.drawString("PC Stats", MARGIN, TITLE_Y);
+  gfx.setTextColor(fg, bg);
+  gfx.setTextDatum(TL_DATUM);
+  gfx.setFreeFont(&FreeSansBold12pt7b);
+  gfx.drawString(title, 10, 8);
 
-  // Separator line
-  tft.drawFastHLine(0, RULE_Y, W, COL_FRAME);
+  // IP status (bottom-left)
+  gfx.setFreeFont(&FreeSans12pt7b);
+  gfx.setTextDatum(BL_DATUM);
+  gfx.drawString(ipText, 10, H - 2);
 
-  // Hint line
-  useLabelFont();
-  tft.drawString("Buttons: Back / Next to cycle pages", MARGIN, RULE_Y + 2);
+  // Main bar
+  int barX = 10;
+  int barY = 50;
+  int barW = W - 20;
+  int barH = 36;
+
+  gfx.drawRect(barX, barY, barW, barH, fg);
+  int fillW = int((valuePct / 100.0f) * (barW - 2));
+  if (fillW < 0) fillW = 0;
+  gfx.fillRect(barX + 1, barY + 1, fillW, barH - 2, accent);
+
+  // Large value
+  gfx.setFreeFont(&FreeSansBold18pt7b);
+  gfx.setTextDatum(TR_DATUM);
+  gfx.drawString(valueText, W - 10, 8);
+
+  // Sparkline
+  int spX = 10;
+  int spW = W - 20;
+  int spY = barY + barH + 10;
+  int spH = 40;
+
+  const float* hist = (gMode == MODE_CPU) ? histCPU : (gMode == MODE_GPU) ? histGPU : histDISK;
+  drawSparkline(spX, spY, spW, spH, hist);
+
+  // Push the entire sprite once (flicker-free)
+  gfx.pushSprite(0, 0);
 }
 
-static void drawBar(int y, int pct, uint16_t color, const char* label, const char* rightHint = nullptr) {
-  const int x = MARGIN;
-  const int w = W - MARGIN*2;
-
-  // frame
-  tft.drawRoundRect(x, y, w, BAR_H, 6, COL_FRAME);
-
-  // fill
-  const int fill = (w - 2) * pct / 100;
-  if (fill > 0) tft.fillRoundRect(x + 1, y + 1, fill, BAR_H - 2, 5, color);
-
-  // text
-  char buf[40];
-  snprintf(buf, sizeof(buf), "%s %d%%", label, pct);
-
-  useLabelFont();
-  tft.setTextDatum(ML_DATUM);
-  tft.drawString(buf, x + 6, y + BAR_H/2 - 6); // tweak -6 to visually center with this font
-
-  if (rightHint && rightHint[0]) {
-    tft.setTextDatum(MR_DATUM);
-    tft.drawString(rightHint, x + w - 6, y + BAR_H/2 - 6);
-  }
-}
-
-static void drawSparkline(int x, int y, int w, int h, const float* hist, uint16_t color) {
-  tft.fillRect(x, y, w, h, COL_BG);
-  tft.drawRect(x, y, w, h, COL_FRAME);
-  if (w <= 2) return;
-
-  int lastX = -1, lastY = -1;
-  for (int px = 1; px < w-1; ++px) {
-    float pos = (float)px * (HIST_LEN - 1) / (float)(w - 2);
-    int i0 = (int)pos;
-    int i1 = (i0 + 1 < HIST_LEN) ? (i0 + 1) : i0;
-    float t = pos - i0;
-
-    int base = (histIndex + 1) % HIST_LEN; // oldest at left
-    int idx0 = (base + i0) % HIST_LEN;
-    int idx1 = (base + i1) % HIST_LEN;
-
-    float v = hist[idx0]*(1.0f - t) + hist[idx1]*t;
-    if (v < 0) v = 0; if (v > 100) v = 100;
-
-    int py = y + (h-2) - (int)((h-2) * (v / 100.0f));
-    int pxAbs = x + px;
-
-    if (lastX >= 0) tft.drawLine(lastX, lastY, pxAbs, py, color);
-    lastX = pxAbs; lastY = py;
-  }
-}
-
-static void drawCPUPage(int C) {
-  tft.fillRect(0, RULE_Y, W, H - RULE_Y, COL_BG);
-
-  int y = BARS_TOP;
-  drawBar(y, C, COL_CPU, "CPU");
-  drawSparkline(MARGIN, y + BAR_H + 2, W - MARGIN*2, SPARK_H, histCPU, COL_SPARK);
-  y += BAR_H + 2 + SPARK_H + BAR_GAP;
-
-  useLabelFont();
-  if (cpuTempF > -100.0f) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "CPU Temp: %.1f F", cpuTempF);
-    tft.drawString(buf, MARGIN, y);
+void render() {
+  if (gMode == MODE_CPU) {
+    String title = "CPU  " + fmtPct(cur.cpu) + "   |   MEM " + fmtPct(cur.mem) + "   " + fmtTempF(cur.cpuTempF);
+    drawBar(title.c_str(), barValue, fmtPct(cur.cpu).c_str());
+  } else if (gMode == MODE_GPU) {
+    String title = "GPU  " + fmtPct(cur.gpu) + "   |   " + fmtTempF(cur.gpuTempF);
+    drawBar(title.c_str(), barValue, fmtPct(cur.gpu).c_str());
   } else {
-    tft.drawString("CPU Temp: N/A", MARGIN, y);
+    String title = "DISK  " + fmtPct(cur.diskPct) + "   |   " + fmtMBps(cur.diskMBps)
+                 + "   |   C:" + fmtGB(cur.freeC) + "  D:" + fmtGB(cur.freeD);
+    drawBar(title.c_str(), barValue, fmtPct(cur.diskPct).c_str());
   }
 }
 
-static void drawGPUPage(int G) {
-  tft.fillRect(0, RULE_Y, W, H - RULE_Y, COL_BG);
-
-  int y = BARS_TOP;
-  drawBar(y, G, COL_GPU, "GPU");
-  drawSparkline(MARGIN, y + BAR_H + 2, W - MARGIN*2, SPARK_H, histGPU, COL_SPARK);
-  y += BAR_H + 2 + SPARK_H + BAR_GAP;
-
-  useLabelFont();
-  if (gpuTempF > -100.0f) {
-    char buf[32];
-    snprintf(buf, sizeof(buf), "GPU Temp: %.1f F", gpuTempF);
-    tft.drawString(buf, MARGIN, y);
-  } else {
-    tft.drawString("GPU Temp: N/A", MARGIN, y);
-  }
+void setBarTargetFromMode() {
+  if (gMode == MODE_CPU) barTarget = cur.cpu;
+  else if (gMode == MODE_GPU) barTarget = cur.gpu;
+  else barTarget = cur.diskPct;
+  if (barTarget < 0) barTarget = 0;
+  if (barTarget > 100) barTarget = 100;
 }
 
-static void drawDISKPage(int D) {
-  tft.fillRect(0, RULE_Y, W, H - RULE_Y, COL_BG);
+// ------------------- CSV parser -------------------
+String serialBuf;
 
-  int y = BARS_TOP;
-  char hint[24] = {0};
-  if (tgtDiskMBps >= 0.0f) snprintf(hint, sizeof(hint), "%.1f MB/s", tgtDiskMBps);
-  drawBar(y, D, COL_DISK, "DISK", (tgtDiskMBps >= 0.0f) ? hint : nullptr);
-  drawSparkline(MARGIN, y + BAR_H + 2, W - MARGIN*2, SPARK_H, histDSK, COL_SPARK);
-  y += BAR_H + 2 + SPARK_H + BAR_GAP;
-
-  useLabelFont();
-  char line1[48], line2[48];
-  if (freeC_GB >= 0.0f) snprintf(line1, sizeof(line1), "C: Free %.0f GB", freeC_GB);
-  else snprintf(line1, sizeof(line1), "C: Free N/A");
-  if (freeD_GB >= 0.0f) snprintf(line2, sizeof(line2), "D: Free %.0f GB", freeD_GB);
-  else snprintf(line2, sizeof(line2), "D: Free N/A");
-  tft.drawString(line1, MARGIN, y);
-  tft.drawString(line2, MARGIN, y + 18);
-}
-
-static void pushHistoryIfDue() {
-  const uint32_t now = millis();
-  if (now < nextHistPushAt) return;
-  nextHistPushAt = now + HIST_PUSH_EVERY_MS;
-
-  histCPU[histIndex] = clamp100f(curCPU);
-  histMEM[histIndex] = clamp100f(curMEM);
-  histGPU[histIndex] = clamp100f(curGPU);
-  histDSK[histIndex] = clamp100f(curDSK);
-  histIndex = (histIndex + 1) % HIST_LEN;
-}
-
-static void animateAndDrawIfDue() {
-  const uint32_t now = millis();
-  if (now < nextFrameAt) return;
-  nextFrameAt = now + FRAME_MS;
-
-  curCPU += (tgtCPU - curCPU) * EASE_ALPHA;
-  curMEM += (tgtMEM - curMEM) * EASE_ALPHA;
-  curGPU += (tgtGPU - curGPU) * EASE_ALPHA;
-  curDSK += (tgtDSK - curDSK) * EASE_ALPHA;
-
-  pushHistoryIfDue();
-
-  static int lastC=-1, lastM=-1, lastG=-1, lastD=-1;
-  int C = clamp100f(curCPU);
-  int M = clamp100f(curMEM);
-  int G = clamp100f(curGPU);
-  int D = clamp100f(curDSK);
-
-  bool changed = false;
-  if (C != lastC) { lastC=C; changed=true; }
-  if (M != lastM) { lastM=M; changed=true; }
-  if (G != lastG) { lastG=G; changed=true; }
-  if (D != lastD) { lastD=D; changed=true; }
-
-  if (!changed) return;
-
-  switch (page) {
-    case 0: drawCPUPage(C); break;
-    case 1: drawGPUPage(G); break;
-    default: drawDISKPage(D); break;
-  }
-}
-
-static void handleButtons() {
-  uint32_t now = millis();
-
-  // NEXT button (PIN_BUTTON_1)
-  bool b1 = digitalRead(PIN_BUTTON_1);
-  if (b1 != lastBtn1 && (now - btn1LastChange) > BTN_DEBOUNCE_MS) {
-    btn1LastChange = now;
-    lastBtn1 = b1;
-    if (b1 == LOW) { // pressed
-      page = (page + 1) % 3;
-      switch (page) {
-        case 0: drawCPUPage(clamp100f(curCPU)); break;
-        case 1: drawGPUPage(clamp100f(curGPU)); break;
-        case 2: drawDISKPage(clamp100f(curDSK)); break;
-      }
+bool parseCSVLine(const String& line) {
+  float vals[9] = {0};
+  int idx = 0, start = 0;
+  for (int i = 0; i <= line.length(); ++i) {
+    if (i == line.length() || line[i] == ',') {
+      if (idx < 9) vals[idx++] = line.substring(start, i).toFloat();
+      start = i + 1;
     }
   }
+  if (idx < 9) return false;
+  cur.cpu      = vals[0];
+  cur.mem      = vals[1];
+  cur.gpu      = vals[2];
+  cur.diskPct  = vals[3];
+  cur.diskMBps = vals[4];
+  cur.cpuTempF = vals[5];
+  cur.gpuTempF = vals[6];
+  cur.freeC    = vals[7];
+  cur.freeD    = vals[8];
+  return true;
+}
 
-  // BACK button (PIN_BUTTON_2)
-  bool b2 = digitalRead(PIN_BUTTON_2);
-  if (b2 != lastBtn2 && (now - btn2LastChange) > BTN_DEBOUNCE_MS) {
-    btn2LastChange = now;
-    lastBtn2 = b2;
-    if (b2 == LOW) { // pressed
-      page = (page + 3 - 1) % 3;   // wrap backwards
-      switch (page) {
-        case 0: drawCPUPage(clamp100f(curCPU)); break;
-        case 1: drawGPUPage(clamp100f(curGPU)); break;
-        case 2: drawDISKPage(clamp100f(curDSK)); break;
-      }
-    }
+// ------------------- Web server -------------------
+const char* PAGE_INDEX =
+"<!doctype html><html><head><meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width, initial-scale=1'>"
+"<title>ESP32 PC Stats</title>"
+"<style>"
+"body{font-family:system-ui,Segoe UI,Arial;padding:16px;background:#111;color:#eee}"
+".row{display:flex;gap:16px;flex-wrap:wrap}"
+".card{background:#1a1a1a;border-radius:12px;padding:16px;min-width:260px;flex:1}"
+".title{font-weight:600;margin:0 0 8px 0}"
+".big{font-size:32px;margin:4px 0 0 0}"
+".mono{font-family:ui-monospace,Consolas,monospace;color:#9ae6b4}"
+"small{opacity:.7}"
+"</style>"
+"</head><body>"
+"<h2>ESP32 PC Stats</h2>"
+"<div id='ip'><small>IP: ...</small></div>"
+"<div class='row'>"
+"  <div class='card'><div class='title'>CPU</div><div class='big'><span id='cpu'>..</span> <small>| MEM <span id='mem'>..</span></small></div>"
+"      <div><small>CPU Temp: <span id='cpuT'>..</span></small></div></div>"
+"  <div class='card'><div class='title'>GPU</div><div class='big'><span id='gpu'>..</span></div>"
+"      <div><small>GPU Temp: <span id='gpuT'>..</span></small></div></div>"
+"  <div class='card'><div class='title'>DISK</div><div class='big'><span id='disk'>..</span></div>"
+"      <div><small>Throughput: <span id='mbps'>..</span></small></div>"
+"      <div><small>Free: C <span class='mono' id='c'>..</span> / D <span class='mono' id='d'>..</span></small></div></div>"
+"</div>"
+"<script>"
+"async function tick(){"
+"  try{"
+"    const j=await (await fetch('/metrics',{cache:'no-store'})).json();"
+"    cpu.textContent = j.cpu.toFixed(0)+'%';"
+"    mem.textContent = j.mem.toFixed(0)+'%';"
+"    cpuT.textContent = (j.cpuTempF<-100?'—':Math.round(j.cpuTempF)+'°F');"
+"    gpu.textContent = j.gpu.toFixed(0)+'%';"
+"    gpuT.textContent = (j.gpuTempF<-100?'—':Math.round(j.gpuTempF)+'°F');"
+"    disk.textContent = j.diskPct.toFixed(0)+'%';"
+"    mbps.textContent = j.diskMBps.toFixed(1)+' MB/s';"
+"    c.textContent = (j.freeC<0?'N/A':Math.round(j.freeC)+' GB');"
+"    d.textContent = (j.freeD<0?'N/A':Math.round(j.freeD)+' GB');"
+"  }catch(e){}"
+"}"
+"async function ip(){"
+"  try{ const t=await (await fetch('/ip',{cache:'no-store'})).text();"
+"       document.getElementById('ip').innerHTML='<small>IP: '+t+'</small>'; }catch(e){}"
+"}"
+"tick(); ip(); setInterval(tick,1000); setInterval(ip,5000);"
+"</script>"
+"</body></html>";
+
+void handleIndex()   { server.send(200, "text/html", PAGE_INDEX); }
+void handleIP()      { server.send(200, "text/plain", ipText); }
+void handleMetrics() {
+  char buf[256];
+  snprintf(buf, sizeof(buf),
+    "{\"cpu\":%.1f,\"mem\":%.1f,\"gpu\":%.1f,\"diskPct\":%.1f,"
+    "\"diskMBps\":%.2f,\"cpuTempF\":%.1f,\"gpuTempF\":%.1f,"
+    "\"freeC\":%.1f,\"freeD\":%.1f}",
+    cur.cpu, cur.mem, cur.gpu, cur.diskPct,
+    cur.diskMBps, cur.cpuTempF, cur.gpuTempF,
+    cur.freeC, cur.freeD);
+  server.send(200, "application/json", buf);
+}
+
+// ------------------- WiFi connect -------------------
+void wifiConnect() {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  // Show a small connecting screen via sprite (no flicker)
+  gfx.setTextColor(fg, bg);
+  gfx.setTextDatum(MC_DATUM);
+  gfx.setFreeFont(&FreeSansBold12pt7b);
+
+  uint32_t start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) {
+    gfx.fillSprite(bg);
+    gfx.drawString("Connecting WiFi...", W/2, H/2 - 12);
+    gfx.setFreeFont(&FreeSans12pt7b);
+    gfx.drawString(String("Status: ") + WiFi.status(), W/2, H/2 + 16);
+    gfx.pushSprite(0, 0);
+    delay(250);
+    yield();
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    IPAddress ip = WiFi.localIP();
+    ipText = ip.toString();
+    server.on("/",        handleIndex);
+    server.on("/metrics", handleMetrics);
+    server.on("/ip",      handleIP);
+    server.begin();
+  } else {
+    ipText = "WiFi: not connected";
   }
 }
 
-// Parse lines like:
-// cpu,mem,gpu,diskPct,diskMBps,cpuTempF,gpuTempF,freeC_GB,freeD_GB
-static void parseLine(char* s) {
-  const int MAXTOK = 9;
-  char* tok[MAXTOK] = {0};
-  int ntok = 0;
-
-  for (char* p = s; *p && ntok < MAXTOK; ++p) {
-    if (ntok == 0) tok[ntok++] = p;
-    if (*p == ',') { *p = 0; if (*(p+1)) tok[ntok++] = p+1; }
-  }
-  if (ntok >= 1) tgtCPU = atof(tok[0]);
-  if (ntok >= 2) tgtMEM = atof(tok[1]);
-  if (ntok >= 3) tgtGPU = atof(tok[2]);
-  if (ntok >= 4) tgtDSK = atof(tok[3]);
-  if (ntok >= 5) tgtDiskMBps = atof(tok[4]); else tgtDiskMBps = -1.0f;
-  if (ntok >= 6) cpuTempF = atof(tok[5]);    else cpuTempF = -999.0f;
-  if (ntok >= 7) gpuTempF = atof(tok[6]);    else gpuTempF = -999.0f;
-  if (ntok >= 8) freeC_GB = atof(tok[7]);    else freeC_GB = -1.0f;
-  if (ntok >= 9) freeD_GB = atof(tok[8]);    else freeD_GB = -1.0f;
-}
-
+// ------------------- Setup / Loop -------------------
 void setup() {
-  Serial.begin(115200);
+  pinMode(PIN_LCD_POWER, OUTPUT);
+  digitalWrite(PIN_LCD_POWER, HIGH);
 
-  pinMode(PIN_POWER_ON, OUTPUT); digitalWrite(PIN_POWER_ON, HIGH);
-  pinMode(PIN_LCD_BL,   OUTPUT); digitalWrite(PIN_LCD_BL, TFT_BACKLIGHT_ON);
+  pinMode(BTN_BACK, INPUT_PULLUP);
+  pinMode(BTN_NEXT, INPUT_PULLUP);
 
-  pinMode(PIN_BUTTON_1, INPUT_PULLUP);
-  pinMode(PIN_BUTTON_2, INPUT_PULLUP);
-  lastBtn1 = digitalRead(PIN_BUTTON_1);
-  lastBtn2 = digitalRead(PIN_BUTTON_2);
+  Serial.begin(BAUD);
 
   tft.init();
-  tft.setRotation(1);
+  tft.setRotation(1);          // 320x170
+  // Create full-screen sprite (≈ 320*170*2B = ~109 KB)
+  gfx.setColorDepth(16);       // RGB565
+  gfx.createSprite(W, H);
 
-  drawHeader();
+  lastAnim = millis();
 
-  unsigned long t0 = millis();
-  while (!Serial && millis() - t0 < 1500) { delay(10); }
-  delay(100);
+  // Initial splash (sprite)
+  gfx.fillSprite(bg);
+  gfx.setTextColor(fg, bg);
+  gfx.setTextDatum(MC_DATUM);
+  gfx.setFreeFont(&FreeSansBold12pt7b);
+  gfx.drawString("PC Monitor", W/2, H/2 - 10);
+  gfx.pushSprite(0, 0);
+  delay(400);
 
-  drawCPUPage(0);
+  // WiFi connect & start web server
+  wifiConnect();
+
+  // Start in CPU mode
+  setBarTargetFromMode();
 }
 
 void loop() {
-  // Read serial lines
-  static char    buf[160];
-  static size_t  n = 0;
+  // Serve HTTP
+  if (WiFi.status() == WL_CONNECTED) {
+    server.handleClient();
+  }
 
+  // Buttons
+  if (buttonPressed(BTN_NEXT)) { nextMode(); setBarTargetFromMode(); }
+  if (buttonPressed(BTN_BACK)) { prevMode(); setBarTargetFromMode(); }
+
+  // Serial CSV input
   while (Serial.available()) {
-    int ch = Serial.read();
-    if (ch < 0) break;
-    if (ch == '\r') continue;
-
-    if (ch == '\n') {
-      buf[n] = 0;
-      parseLine(buf);
-      n = 0;
-    } else {
-      if (n < sizeof(buf) - 1) buf[n++] = (char)ch;
-      else n = 0; // overflow guard
+    char c = (char)Serial.read();
+    if (c == '\n') {
+      if (parseCSVLine(serialBuf)) {
+        histCPU[histIdx]  = cur.cpu;
+        histGPU[histIdx]  = cur.gpu;
+        histDISK[histIdx] = cur.diskPct;
+        histIdx = (histIdx + 1) % HIST_N;
+        setBarTargetFromMode();
+      }
+      serialBuf = "";
+    } else if (c != '\r') {
+      serialBuf += c;
+      if (serialBuf.length() > 200) serialBuf.remove(0, serialBuf.length() - 200);
     }
   }
 
-  handleButtons();
-  animateAndDrawIfDue();
-  delay(1);
+  // ~30 FPS pacing
+  static uint32_t nextFrame = 0;
+  uint32_t now = millis();
+  if (now >= nextFrame) {
+    nextFrame = now + 33;  // ~30 FPS
+    animateBar();
+    render();
+  }
 }
