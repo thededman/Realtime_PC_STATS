@@ -1,4 +1,4 @@
-import sys
+import sys, os
 import time
 import threading
 import queue
@@ -6,6 +6,9 @@ import traceback
 import psutil
 import serial
 import serial.tools.list_ports
+import subprocess, shutil   # for nvidia-smi fallback
+import tkinter as tk
+from tkinter import ttk, messagebox
 
 # Optional GPU (NVIDIA) via NVML
 try:
@@ -14,16 +17,43 @@ try:
 except Exception:
     HAVE_NVML = False
 
-import tkinter as tk
-from tkinter import ttk, messagebox
-
-APP_TITLE = "PC Stats Feeder"
+APP_TITLE = "ESP32 PC Stats Feeder"
 BAUD_DEFAULT = 115200
 SEND_HZ = 5                 # how many times per second to send
 SEND_INTERVAL = 1.0 / SEND_HZ
 
 # Default drives to report free space
 DEFAULT_DRIVES = ["C", "D"]
+
+def _resource_path(name: str) -> str:
+    """Return absolute path to a bundled resource (PyInstaller) or local file."""
+    base = getattr(sys, "_MEIPASS", None)
+    if base is None:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, name)
+
+# ---- Windows helpers to suppress console windows for subprocess ----
+if os.name == "nt":
+    try:
+        WIN_CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]
+    except Exception:
+        WIN_CREATE_NO_WINDOW = 0x08000000  # fallback
+    _HIDDEN_SI = subprocess.STARTUPINFO()
+    _HIDDEN_SI.dwFlags |= subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+else:
+    WIN_CREATE_NO_WINDOW = 0
+    _HIDDEN_SI = None
+
+def _run_nvidia_smi_hidden(args, timeout=0.5) -> str:
+    """Run nvidia-smi with no flashing console and return stdout (str)."""
+    return subprocess.check_output(
+        args,
+        stderr=subprocess.DEVNULL,
+        timeout=timeout,
+        shell=False,
+        startupinfo=_HIDDEN_SI,
+        creationflags=WIN_CREATE_NO_WINDOW,
+    ).decode("ascii", errors="ignore").strip()
 
 class FeederThread(threading.Thread):
     def __init__(self, port_getter, baud_getter, gpu_enabled_getter,
@@ -42,8 +72,11 @@ class FeederThread(threading.Thread):
         self.last_disk = psutil.disk_io_counters()
         self.last_time = time.time()
 
+        # GPU backends
         self.nvml_ok = False
         self.nvml_handle = None
+        self.smi_ok = False
+        self.smi_path = shutil.which("nvidia-smi")
 
     def run(self):
         port = self.port_getter()
@@ -56,16 +89,25 @@ class FeederThread(threading.Thread):
             self.on_disconnect()
             return
 
-        # NVML (GPU) init if requested and available
-        if self.gpu_enabled_getter() and HAVE_NVML:
-            try:
-                pynvml.nvmlInit()
-                self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-                self.nvml_ok = True
-                self.log("NVML initialized (GPU 0).")
-            except Exception as e:
-                self.log(f"NVML init failed: {e}")
-                self.nvml_ok = False
+        # --- GPU init: NVML → fallback to nvidia-smi ---
+        if self.gpu_enabled_getter():
+            if HAVE_NVML:
+                try:
+                    # If your system needs an explicit DLL dir, uncomment and adjust:
+                    # os.add_dll_directory(r"C:\Program Files\NVIDIA Corporation\NVSMI")
+                    pynvml.nvmlInit()
+                    self.nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    self.nvml_ok = True
+                    self.log("NVML initialized (GPU 0).")
+                except Exception as e:
+                    self.log(f"NVML init failed: {e}")
+                    self.nvml_ok = False
+            if not self.nvml_ok:
+                if self.smi_path:
+                    self.smi_ok = True
+                    self.log(f"Using nvidia-smi fallback: {self.smi_path}")
+                else:
+                    self.log("GPU fallback disabled: nvidia-smi not found in PATH.")
 
         # Warm up CPU % counter (non-blocking)
         psutil.cpu_percent(interval=None)
@@ -93,34 +135,46 @@ class FeederThread(threading.Thread):
                 # Temps / Free space:
                 cpu_temp_f = -999.0
                 try:
-                    # Windows “CPU Package” temp may not always be available via psutil.
-                    # If psutil has sensors_temperatures, try common keys:
                     if hasattr(psutil, "sensors_temperatures"):
                         temps = psutil.sensors_temperatures(fahrenheit=False) or {}
-                        # try common keys in order
                         for key in ("coretemp", "k10temp", "acpitz", "cpu-thermal", "nvme"):
                             if key in temps and temps[key]:
-                                # take first reading
                                 c = temps[key][0].current
                                 cpu_temp_f = c * 9.0/5.0 + 32.0
                                 break
                 except Exception:
                     pass
 
+                # --- GPU read (NVML → nvidia-smi → zeros) ---
                 gpu = 0.0
                 gpu_temp_f = -999.0
-                if self.gpu_enabled_getter() and self.nvml_ok:
-                    try:
-                        util = pynvml.nvmlDeviceGetUtilizationRates(self.nvml_handle)
-                        gpu = float(util.gpu)  # percent
-
-                        tC = pynvml.nvmlDeviceGetTemperature(
-                            self.nvml_handle, pynvml.NVML_TEMPERATURE_GPU
-                        )
-                        gpu_temp_f = tC * 9.0/5.0 + 32.0
-                    except Exception:
-                        # if GPU disappears, keep zeros
-                        pass
+                if self.gpu_enabled_getter():
+                    if self.nvml_ok:
+                        try:
+                            util = pynvml.nvmlDeviceGetUtilizationRates(self.nvml_handle)
+                            gpu = float(util.gpu)
+                            tC = pynvml.nvmlDeviceGetTemperature(
+                                self.nvml_handle, pynvml.NVML_TEMPERATURE_GPU
+                            )
+                            gpu_temp_f = tC * 9.0/5.0 + 32.0
+                        except Exception:
+                            pass
+                    elif self.smi_ok:
+                        try:
+                            out = _run_nvidia_smi_hidden(
+                                [self.smi_path,
+                                 "--query-gpu=utilization.gpu,temperature.gpu",
+                                 "--format=csv,noheader,nounits"],
+                                timeout=0.5
+                            )
+                            # Example: "12, 45"
+                            parts = out.split(",")
+                            if len(parts) >= 2:
+                                gpu = float(parts[0].strip())
+                                tC = float(parts[1].strip())
+                                gpu_temp_f = tC * 9.0/5.0 + 32.0
+                        except Exception:
+                            pass
 
                 # Free space for selected drives
                 drives = self.drives_getter()
@@ -184,6 +238,12 @@ class App(tk.Tk):
         self.title(APP_TITLE)
         self.resizable(False, False)
 
+        # Set window icon (also works inside PyInstaller bundle)
+        try:
+            self.iconbitmap(_resource_path("app.ico"))
+        except Exception:
+            pass  # icon is optional
+
         # state
         self.feeder = None
         self.ui_queue = queue.Queue()
@@ -210,16 +270,15 @@ class App(tk.Tk):
         self.baud_cmb.set(str(BAUD_DEFAULT))
 
         # Row 1: GPU enable + disk scale + drives
-        self.gpu_var = tk.BooleanVar(value=True and HAVE_NVML)
-        self.gpu_chk = ttk.Checkbutton(frm, text=f"Enable GPU (NVML){'' if HAVE_NVML else ' - not installed'}",
-                                       variable=self.gpu_var)
-        self.gpu_chk.grid(column=0, row=1, columnspan=2, sticky="w", pady=(8, 0))
+        self.gpu_var = tk.BooleanVar(value=True)
+        self.gpu_chk = ttk.Checkbutton(frm, text="Enable GPU (NVML or nvidia-smi fallback)", variable=self.gpu_var)
+        self.gpu_chk.grid(column=0, row=1, columnspan=3, sticky="w", pady=(8, 0))
 
-        ttk.Label(frm, text="Disk 100% =").grid(column=2, row=1, sticky="e", padx=(10, 2), pady=(8, 0))
+        ttk.Label(frm, text="Disk 100% =").grid(column=3, row=1, sticky="e", padx=(10, 2), pady=(8, 0))
         self.disk_scale = tk.DoubleVar(value=200.0)  # MB/s that maps to 100%
         self.disk_entry = ttk.Entry(frm, textvariable=self.disk_scale, width=7)
-        self.disk_entry.grid(column=3, row=1, sticky="w", pady=(8, 0))
-        ttk.Label(frm, text="MB/s").grid(column=4, row=1, sticky="w", pady=(8, 0))
+        self.disk_entry.grid(column=4, row=1, sticky="w", pady=(8, 0))
+        ttk.Label(frm, text="MB/s").grid(column=4, row=1, sticky="e", padx=(60, 0), pady=(8, 0))
 
         ttk.Label(frm, text="Drives (comma):").grid(column=0, row=2, sticky="w", pady=(8, 0))
         self.drives_var = tk.StringVar(value=",".join(DEFAULT_DRIVES))
@@ -328,7 +387,6 @@ class App(tk.Tk):
         self.disconnect_btn.config(state="disabled")
 
     def _on_thread_disconnected(self):
-        # Called from feeder thread on its way out
         def _ui():
             self.feeder = None
             self.connect_btn.config(state="normal")
@@ -339,7 +397,6 @@ class App(tk.Tk):
         try:
             if self.feeder:
                 self.feeder.stop()
-                # small grace period
                 time.sleep(0.15)
         except Exception:
             pass
