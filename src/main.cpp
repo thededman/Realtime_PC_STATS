@@ -167,7 +167,8 @@ String fmtTempF(float v)
     if (v < -100)
         return "-";
     char b[16];
-    snprintf(b, sizeof(b), "%.0f\xB0F", v);
+    // Free fonts only cover standard ASCII so we skip the degree symbol to avoid crashes.
+    snprintf(b, sizeof(b), "%.0fF", v);
     return String(b);
 }
 String fmtMBps(float v)
