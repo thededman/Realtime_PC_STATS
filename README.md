@@ -19,6 +19,15 @@ The Arduino sketch has been migrated to a PlatformIO project.
 
 Firmware source now lives in `src/main.cpp`. Update your Wi-Fi credentials near the top of that file before building.
 
+### Optional Wi-Fi dashboard
+- Wi-Fi is not required for USB stats, but if you want the built-in web view, set `WIFI_SSID` and `WIFI_PASS` near the top of `src/main.cpp`.
+- After flashing, the display will show the assigned IP when it connects. Visit `http://<that-ip>/` for the mini dashboard, `/metrics` for JSON, or `/ip` for a plain-text IP echo.
+- If the Wi-Fi credentials are left as defaults, the device simply shows `WiFi: not connected` and continues to work over USB.
+
+### Display modes
+- The right-side button cycles forward through CPU -> GPU -> Disk views, and the left-side button goes backward.
+- Each mode changes the large bar graph, sparkline, and text overlays so you can focus on the stat you care about without re-flashing anything.
+
 ## PC feeder requirements
 Once the firmware is flashed, run the feeder script to stream stats over USB serial.
 
