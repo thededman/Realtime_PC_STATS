@@ -1,6 +1,8 @@
 # Realtime PC STATS
 Using a Lilygo T-Display S3 to update the status of the PC by serial connection.
 
+A tiny, nerdy cyber-tricorder on your desk. :-)
+
 Board used: https://a.co/d/iN3adDc
 
 ## Firmware build (PlatformIO)
