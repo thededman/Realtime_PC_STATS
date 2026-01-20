@@ -10,6 +10,14 @@ import subprocess, shutil   # for nvidia-smi fallback
 import tkinter as tk
 from tkinter import ttk, messagebox
 
+# System tray support
+try:
+    import pystray
+    from PIL import Image
+    HAVE_TRAY = True
+except ImportError:
+    HAVE_TRAY = False
+
 # Optional GPU (NVIDIA) via NVML
 try:
     import pynvml
@@ -300,6 +308,10 @@ class App(tk.Tk):
         self.ui_queue = queue.Queue()
         self.last_log_replace = False
 
+        # System tray
+        self.tray_icon = None
+        self._setup_tray()
+
         # --- UI ---
         frm = ttk.Frame(self, padding=10)
         frm.grid(column=0, row=0, sticky="nsew")
@@ -343,11 +355,16 @@ class App(tk.Tk):
         self.gpu_index_cmb.grid(column=3, row=2, columnspan=2, sticky="w")
         self.gpu_index_cmb.set(gpu_list[0])
 
-        # Row 3: Connect / Disconnect
+        # Row 3: Connect / Disconnect / Minimize to Tray
         self.connect_btn = ttk.Button(frm, text="Connect", command=self._connect)
         self.connect_btn.grid(column=0, row=3, pady=(10, 0), sticky="w")
         self.disconnect_btn = ttk.Button(frm, text="Disconnect", command=self._disconnect, state="disabled")
         self.disconnect_btn.grid(column=1, row=3, pady=(10, 0), sticky="w")
+
+        # Minimize to tray button (only if pystray is available)
+        if HAVE_TRAY:
+            self.tray_btn = ttk.Button(frm, text="Minimize to Tray", command=self._minimize_to_tray)
+            self.tray_btn.grid(column=2, row=3, pady=(10, 0), padx=(6, 0), sticky="w")
 
         # Row 4: Status text
         self.status = tk.Text(frm, height=8, width=70, wrap="word")
@@ -459,11 +476,78 @@ class App(tk.Tk):
             self.disconnect_btn.config(state="disabled")
         self.after(0, _ui)
 
+    # ---- System Tray ----
+    def _setup_tray(self):
+        """Initialize the system tray icon (hidden until minimize)."""
+        if not HAVE_TRAY:
+            return
+
+        # Try to load the app icon, otherwise create a simple default icon
+        icon_image = None
+        try:
+            ico_path = _resource_path("app.ico")
+            if os.path.exists(ico_path):
+                icon_image = Image.open(ico_path)
+        except Exception:
+            pass
+
+        # Fallback: create a simple colored square icon
+        if icon_image is None:
+            icon_image = Image.new("RGB", (64, 64), color=(0, 120, 212))
+
+        # Create tray menu
+        menu = pystray.Menu(
+            pystray.MenuItem("Show", self._restore_from_tray, default=True),
+            pystray.MenuItem("Exit", self._exit_from_tray)
+        )
+
+        self.tray_icon = pystray.Icon(APP_TITLE, icon_image, APP_TITLE, menu)
+
+    def _minimize_to_tray(self):
+        """Hide window and show system tray icon."""
+        if not HAVE_TRAY or self.tray_icon is None:
+            return
+
+        self.withdraw()  # Hide the window
+
+        # Run tray icon in a separate thread
+        def run_tray():
+            self.tray_icon.run()
+
+        threading.Thread(target=run_tray, daemon=True).start()
+
+    def _restore_from_tray(self, icon=None, item=None):
+        """Restore window from system tray."""
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+
+        # Schedule UI update on main thread
+        self.after(0, self._show_window)
+
+    def _show_window(self):
+        """Show and focus the window."""
+        self.deiconify()  # Show the window
+        self.lift()       # Bring to front
+        self.focus_force()
+        # Re-setup tray icon for next minimize
+        self._setup_tray()
+
+    def _exit_from_tray(self, icon=None, item=None):
+        """Exit application from tray menu."""
+        if self.tray_icon is not None:
+            self.tray_icon.stop()
+        self.after(0, self._on_close)
+
     def _on_close(self):
         try:
             if self.feeder:
                 self.feeder.stop()
                 time.sleep(0.15)
+        except Exception:
+            pass
+        try:
+            if self.tray_icon is not None:
+                self.tray_icon.stop()
         except Exception:
             pass
         self.destroy()
