@@ -6,3 +6,8 @@
 
 # Secrets - never commit actual credentials
 include/secrets.h
+
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
