@@ -33,13 +33,38 @@ Firmware source now lives in `src/main.cpp`. Update your Wi-Fi credentials near 
 ## PC feeder requirements
 Once the firmware is flashed, run the feeder script to stream stats over USB serial.
 
-- Update COM port values inside `feeder.py` (or use `Feeder.exe`).
-- Install feeder dependencies:
-  ```
-  python -m pip install psutil pyserial GPUtil
-  ```
+### Option 1: Pre-built EXE (recommended)
+Download `ESP32_PC_Stats_Feeder.exe` from the releases - no Python installation required.
 
-I have also included a `Feeder.exe`, which makes this easier if you do not want to install Python.
+### Option 2: Run from Python
+1. Install dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+2. Run the GUI:
+   ```
+   python feeder_gui.py
+   ```
+
+### Option 3: Build your own EXE
+If you want to build the EXE yourself:
+
+1. Make sure Python 3.8+ is installed
+2. Run the build script:
+   ```
+   build_exe.bat
+   ```
+3. The EXE will be created at `dist\ESP32_PC_Stats_Feeder.exe`
+
+**Optional:** Add an `app.ico` file to the project root for a custom window/tray icon.
+
+## Configuration (secrets)
+Copy `include/secrets_template.h` to `include/secrets.h` and fill in your:
+- Wi-Fi SSID and password
+- OpenWeatherMap API key (free tier works)
+- City name for weather
+
+The `secrets.h` file is gitignored to keep your credentials safe.
 
 I am no coder, but I am learning. Most of the code was reviewed by ChatGPT to get the display working, which was a pain.
 
