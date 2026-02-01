@@ -9,7 +9,29 @@
 
 #include <ArduinoJson.h>
 
-#include "secrets.h"
+#include "config_portal.h"
+#include "weather_config.h"
+
+// Build API URL dynamically from portal config
+static String buildWeatherUrl() {
+  String url = "https://api.openweathermap.org/data/2.5/weather?q=";
+  url += getConfigCity();
+  url += "&appid=";
+  url += getConfigApiKey();
+  url += "&units=";
+  url += getConfigUnits();
+  return url;
+}
+
+static String buildForecastUrl() {
+  String url = "https://api.openweathermap.org/data/2.5/forecast?q=";
+  url += getConfigCity();
+  url += "&appid=";
+  url += getConfigApiKey();
+  url += "&units=";
+  url += getConfigUnits();
+  return url;
+}
 
 namespace {
 
@@ -65,7 +87,8 @@ void WeatherAPI::setTime() {
 
 bool WeatherAPI::getData(WeatherData &data, WeatherDisplayState &state) {
   HTTPClient http;
-  if (!http.begin(client_, OPENWEATHERMAP_API_ENDPOINT)) {
+  String url = buildWeatherUrl();
+  if (!http.begin(client_, url)) {
     state.lastFetchOk = false;
     return false;
   }
@@ -98,8 +121,9 @@ bool WeatherAPI::getData(WeatherData &data, WeatherDisplayState &state) {
   JsonObject wind = doc["wind"];
   data.windSpeed = wind["speed"] | NAN;
 
+  const char* cityFallback = getConfigCity().c_str();
   strlcpy(data.location,
-          doc["name"] | OPENWEATHERMAP_CITY,
+          doc["name"] | cityFallback,
           sizeof(data.location));
   JsonObject weather0 = doc["weather"][0];
   strlcpy(data.description,
@@ -129,7 +153,8 @@ bool WeatherAPI::getData(WeatherData &data, WeatherDisplayState &state) {
 
 bool WeatherAPI::fetchForecast(WeatherData &data) {
   HTTPClient http;
-  if (!http.begin(client_, OPENWEATHERMAP_FORECAST_ENDPOINT)) {
+  String url = buildForecastUrl();
+  if (!http.begin(client_, url)) {
     return false;
   }
 

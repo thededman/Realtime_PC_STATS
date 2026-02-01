@@ -6,6 +6,7 @@
 #include <math.h>
 #include "Free_Fonts.h"   // Bodmer free fonts
 #include "weather_integration.h"
+#include "config_portal.h"
 
 // M5Stack Core3 PC Monitor Dashboard + WiFi Web Server + Weather Mode
 // - Modes: CPU, GPU, DISK, WEATHER (cycle with right/left buttons)
@@ -17,32 +18,7 @@
 //   GET /metrics -> JSON {cpu, mem, gpu, diskPct, diskMBps, cpuTempF, gpuTempF, freeC, freeD}
 //   GET /ip     -> plain text IP
 
-// ---------------------- WiFi CONFIG ----------------------
-// Secrets can optionally define WIFI_SSID/WIFI_PASSWORD macros.
-#ifdef WIFI_SSID
-static const char kSecretWifiSsid[] = WIFI_SSID;
-#define PIO_WIFI_SSID kSecretWifiSsid
-#else
-#define PIO_WIFI_SSID "YourWifiName"
-#endif
-
-#ifdef WIFI_PASSWORD
-static const char kSecretWifiPass[] = WIFI_PASSWORD;
-#define PIO_WIFI_PASS kSecretWifiPass
-#else
-#define PIO_WIFI_PASS "YourWifiPassword"
-#endif
-
-#ifdef WIFI_SSID
-#undef WIFI_SSID
-#endif
-#ifdef WIFI_PASSWORD
-#undef WIFI_PASSWORD
-#endif
-
-const char *WIFI_SSID = PIO_WIFI_SSID;
-const char *WIFI_PASS = PIO_WIFI_PASS;
-// ---------------------------------------------------------
+// WiFi credentials now come from config portal (stored in NVS)
 
 // Full-screen sprite for flicker-free rendering (M5Unified)
 LGFX_Sprite gfx(&M5.Display); // off-screen framebuffer (RGB565)
@@ -51,6 +27,11 @@ LGFX_Sprite gfx(&M5.Display); // off-screen framebuffer (RGB565)
 int touchStartX = -1;
 bool touchActive = false;
 static const int SWIPE_THRESHOLD = 50;
+
+// Long press detection for setup mode
+uint32_t touchStartTime = 0;
+bool longPressTriggered = false;
+static const uint32_t LONG_PRESS_MS = 3000;  // 3 seconds
 
 // Serial
 static const unsigned long BAUD = 115200;
@@ -66,6 +47,7 @@ struct Stats {
   float cpuTempF = -999, gpuTempF = -999;
   float freeC = -1, freeD = -1;
   float indoorTempF = -999;
+  uint32_t lastUpdateMs = 0;  // millis() when last serial data received
 } cur;
 
 // History buffers for sparkline (60 samples)
@@ -97,6 +79,7 @@ String ipText = "WiFi...";
 // Forward decl
 void setBarTargetFromMode();
 void render();
+void enterSetupMode();
 
 // ------------------- Mode navigation -------------------
 void nextMode() {
@@ -112,22 +95,35 @@ void handleTouch() {
   M5.update();
   auto touch = M5.Touch.getDetail();
 
-  if (touch.wasPressed()) {
-    touchStartX = touch.x;
-    touchActive = true;
+  // Long press detection
+  if (touch.isPressed()) {
+    if (touchStartTime == 0) {
+      touchStartTime = millis();
+      touchStartX = touch.x;
+      touchActive = true;
+    } else if (!longPressTriggered && millis() - touchStartTime > LONG_PRESS_MS) {
+      longPressTriggered = true;
+      enterSetupMode();
+      return;
+    }
   }
 
-  if (touch.wasReleased() && touchActive) {
-    int deltaX = touch.x - touchStartX;
-    if (deltaX > SWIPE_THRESHOLD) {
-      prevMode();  // Swipe right = previous mode
-      setBarTargetFromMode();
-    } else if (deltaX < -SWIPE_THRESHOLD) {
-      nextMode();  // Swipe left = next mode
-      setBarTargetFromMode();
+  if (touch.wasReleased()) {
+    // Only handle swipe if not a long press
+    if (!longPressTriggered && touchActive) {
+      int deltaX = touch.x - touchStartX;
+      if (deltaX > SWIPE_THRESHOLD) {
+        prevMode();  // Swipe right = previous mode
+        setBarTargetFromMode();
+      } else if (deltaX < -SWIPE_THRESHOLD) {
+        nextMode();  // Swipe left = next mode
+        setBarTargetFromMode();
+      }
     }
     touchActive = false;
     touchStartX = -1;
+    touchStartTime = 0;
+    longPressTriggered = false;
   }
 }
 
@@ -297,6 +293,7 @@ bool parseCSVLine(const String &line) {
   cur.freeC    = vals[7];
   cur.freeD    = vals[8];
   cur.indoorTempF = (idx >= 10) ? vals[9] : cur.cpuTempF;
+  cur.lastUpdateMs = millis();
   return true;
 }
 
@@ -420,8 +417,29 @@ const char *PAGE_INDEX = R"HTML(
         const json = await response.json();
         applyStats(json);
         applyWeather(json.weather, json.forecast);
+        // Update data status indicator
+        const statusEl = document.getElementById('dataStatus');
+        if (statusEl) {
+          const ageMs = json.dataAgeMs;
+          const uptime = json.uptimeMs;
+          if (ageMs < 0) {
+            statusEl.textContent = 'No serial data received yet (uptime: ' + Math.floor(uptime/1000) + 's)';
+            statusEl.style.color = '#f44';
+          } else if (ageMs > 10000) {
+            statusEl.textContent = 'Serial data stale: ' + Math.floor(ageMs/1000) + 's ago';
+            statusEl.style.color = '#fa0';
+          } else {
+            statusEl.textContent = 'Serial data: ' + (ageMs < 1000 ? 'live' : Math.floor(ageMs/1000) + 's ago');
+            statusEl.style.color = '#0f0';
+          }
+        }
       } catch (err) {
         console.error(err);
+        const statusEl = document.getElementById('dataStatus');
+        if (statusEl) {
+          statusEl.textContent = 'Fetch error: ' + err.message;
+          statusEl.style.color = '#f44';
+        }
       }
     }
     setInterval(refresh, 2000);
@@ -431,6 +449,9 @@ const char *PAGE_INDEX = R"HTML(
 <body>
   <main class="wrap">
     <h1>ESP32 PC Stats</h1>
+    <div class="status-bar" style="text-align:center;margin-bottom:0.8rem;font-size:0.85rem;color:#888;">
+      <span id="dataStatus">Waiting for data...</span>
+    </div>
     <div class="grid">
       <div class="card"><div class="label">CPU %</div><div id="cpu" class="value">-</div></div>
       <div class="card"><div class="label">MEM %</div><div id="mem" class="value">-</div></div>
@@ -498,6 +519,10 @@ void handleMetrics() {
   if (isnan(cur.freeC) || cur.freeC < 0) doc["freeC"] = nullptr; else doc["freeC"] = cur.freeC;
   if (isnan(cur.freeD) || cur.freeD < 0) doc["freeD"] = nullptr; else doc["freeD"] = cur.freeD;
 
+  // Include timestamp of last serial data for debugging
+  doc["dataAgeMs"] = (cur.lastUpdateMs > 0) ? (millis() - cur.lastUpdateMs) : -1;
+  doc["uptimeMs"] = millis();
+
   const WeatherData &w = display.getWeatherData();
   const WeatherDisplayState &ws = display.getDisplayState();
   JsonObject weather = doc["weather"].to<JsonObject>();
@@ -535,10 +560,35 @@ void handleMetrics() {
   server.send(200, "application/json", payload);
 }
 
+// ------------------- Enter Setup Mode -------------------
+void enterSetupMode() {
+  // Show entering setup message
+  gfx.fillSprite(bg);
+  gfx.setTextColor(TFT_YELLOW, bg);
+  gfx.setTextDatum(MC_DATUM);
+  gfx.setFreeFont(&FreeSansBold12pt7b);
+  gfx.drawString("Entering Setup...", W / 2, H / 2);
+  gfx.pushSprite(0, 0);
+  delay(500);
+
+  // Stop current web server if running
+  server.stop();
+
+  // Start captive portal
+  configPortalStart();
+}
+
 // ------------------- WiFi connect -------------------
-void wifiConnect() {
+bool wifiConnect() {
+  String ssid = getConfigWifiSSID();
+  String pass = getConfigWifiPass();
+
+  if (ssid.isEmpty()) {
+    return false;  // No credentials, need setup
+  }
+
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(ssid.c_str(), pass.c_str());
 
   // Show a small connecting screen via sprite (no flicker)
   gfx.setTextColor(fg, bg);
@@ -546,11 +596,14 @@ void wifiConnect() {
   gfx.setFreeFont(&FreeSansBold12pt7b);
 
   uint32_t start = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - start < 12000) {
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     gfx.fillSprite(bg);
-    gfx.drawString("Connecting WiFi...", W / 2, H / 2 - 12);
+    gfx.drawString("Connecting WiFi...", W / 2, H / 2 - 24);
     gfx.setFreeFont(&FreeSans12pt7b);
-    gfx.drawString(String("Status: ") + WiFi.status(), W / 2, H / 2 + 16);
+    gfx.drawString(ssid, W / 2, H / 2 + 8);
+    gfx.setTextColor(TFT_DARKGREY, bg);
+    gfx.drawString(String("Status: ") + WiFi.status(), W / 2, H / 2 + 40);
+    gfx.setTextColor(fg, bg);
     gfx.pushSprite(0, 0);
     delay(250);
     yield();
@@ -564,8 +617,10 @@ void wifiConnect() {
     server.on("/metrics", handleMetrics);
     server.on("/ip", handleIP);
     server.begin();
+    return true;
   } else {
     ipText = "WiFi: not connected";
+    return false;
   }
 }
 
@@ -593,8 +648,24 @@ void setup() {
   gfx.pushSprite(0, 0);
   delay(400);
 
-  // WiFi connect & start web server
-  wifiConnect();
+  // Initialize config portal and check for saved config
+  configPortalInit();
+
+  // Check if we have saved configuration
+  if (!configPortalCheck()) {
+    // No config - start setup portal
+    Serial.println("No config found, starting setup portal...");
+    configPortalStart();
+    return;  // Loop will handle portal
+  }
+
+  // Try to connect to WiFi with saved credentials
+  if (!wifiConnect()) {
+    // WiFi failed - start setup portal
+    Serial.println("WiFi connection failed, starting setup portal...");
+    configPortalStart();
+    return;  // Loop will handle portal
+  }
 
   // Init weather subsystem AFTER WiFi is up
   weatherInit();
@@ -604,12 +675,18 @@ void setup() {
 }
 
 void loop() {
+  // If in setup mode, handle portal only
+  if (isInSetupMode()) {
+    configPortalLoop();
+    return;
+  }
+
   // Serve HTTP if connected
   if (WiFi.status() == WL_CONNECTED) {
     server.handleClient();
   }
 
-  // Touch swipe for mode navigation
+  // Touch swipe for mode navigation (includes long-press detection)
   handleTouch();
 
   // Serial CSV input (PC stats)
