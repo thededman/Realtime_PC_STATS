@@ -3,11 +3,9 @@
 
 // ==================== DISPLAY CONFIGURATION ====================
 #define SPRITE_WIDTH 320
-#define SPRITE_HEIGHT 170
+#define SPRITE_HEIGHT 240  // M5Stack Core3: 320x240
 #define ERRSPRITE_WIDTH 164
 #define ERRSPRITE_HEIGHT 15
-#define BACKLIGHT_PIN 38
-#define POWER_PIN 15
 #define DEFAULT_BRIGHTNESS 215
 #define GRAY_LEVELS 13
 
@@ -26,11 +24,9 @@
 #define DAYLIGHT_OFFSET_SEC 3600  // +1 hour for Daylight Saving Time
 #define WIFI_TIMEOUT_MS 5000
 
-// ==================== BUTTON CONFIGURATION ====================
-#define BUTTON_BOOT 0      // GPIO0 - Boot button (brightness down - bottom button)
-#define BUTTON_KEY 14      // GPIO14 - Key button (brightness up - top button)
-#define BRIGHTNESS_STEP 25 // Step size for brightness changes
-#define BUTTON_DEBOUNCE_MS 200  // Debounce delay
+// ==================== TOUCH CONFIGURATION (M5Stack Core3) ====================
+#define SWIPE_THRESHOLD 50      // Minimum pixels for swipe detection
+#define BRIGHTNESS_STEP 25      // Step size for brightness changes
 
 // ==================== DISPLAY COLORS ====================
 #define TFT_BLACK 0x0000

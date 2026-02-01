@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(pip install:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Bash(dir:*)",
+      "Bash(pio run:*)"
     ]
   }
 }
