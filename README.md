@@ -1,70 +1,144 @@
 # Realtime PC STATS
-Using a Lilygo T-Display S3 to update the status of the PC by serial connection.
 
-A tiny, nerdy cyber-tricorder on your desk. :-)
+A real-time PC monitoring dashboard on an M5Stack Core3, featuring touch screen navigation and weather display.
 
-Board used: https://a.co/d/iN3adDc
+**Board:** [M5Stack Core3](https://shop.m5stack.com/products/m5stack-cores3-esp32s3-lotdevelopment-kit) (ESP32-S3, 320x240 touch display)
 
-## Firmware build (PlatformIO)
-The Arduino sketch has been migrated to a PlatformIO project.
+## Features
 
-1. Install [PlatformIO](https://platformio.org/install) (VS Code extension or CLI).
-2. From the repository root run:
-   ```
-   pio run -t upload
-   ```
-   This builds the firmware and flashes it to the LilyGO T-Display S3.
-3. Optional: open the serial monitor at 115200 baud.
-   ```
-   pio device monitor
-   ```
+- **PC Stats**: CPU, Memory, GPU, Disk usage with animated bar graphs and sparklines
+- **Weather**: Current conditions and 3-day forecast via OpenWeatherMap
+- **Touch Navigation**: Swipe left/right to change display modes
+- **WiFi Dashboard**: Access stats from any browser on your network
+- **Captive Portal Setup**: No code editing required - configure WiFi and weather via web browser
 
-Firmware source now lives in `src/main.cpp`. Update your Wi-Fi credentials near the top of that file before building.
+## Quick Start
 
-### Optional Wi-Fi dashboard
-- Wi-Fi is not required for USB stats, but if you want the built-in web view, set `WIFI_SSID` and `WIFI_PASS` near the top of `src/main.cpp`.
-- After flashing, the display will show the assigned IP when it connects. Visit `http://<that-ip>/` for the mini dashboard, `/metrics` for JSON, or `/ip` for a plain-text IP echo.
-- If the Wi-Fi credentials are left as defaults, the device simply shows `WiFi: not connected` and continues to work over USB.
+### 1. Flash the Firmware
 
-### Display modes
-- The right-side button cycles forward through CPU -> GPU -> Disk views, and the left-side button goes backward.
-- Each mode changes the large bar graph, sparkline, and text overlays so you can focus on the stat you care about without re-flashing anything.
+Install [PlatformIO](https://platformio.org/install) (VS Code extension or CLI), then:
 
-## PC feeder requirements
-Once the firmware is flashed, run the feeder script to stream stats over USB serial.
+```bash
+pio run -t upload
+```
 
-### Option 1: Pre-built EXE (recommended)
-Download `ESP32_PC_Stats_Feeder.exe` from the releases - no Python installation required.
+### 2. First-Time Setup (Captive Portal)
 
-### Option 2: Run from Python
-1. Install dependencies:
-   ```
-   pip install -r requirements.txt
-   ```
-2. Run the GUI:
-   ```
-   python feeder_gui.py
-   ```
+On first boot (or after erasing settings), the device enters setup mode:
 
-### Option 3: Build your own EXE
-If you want to build the EXE yourself:
+1. Connect your phone/laptop to WiFi network: **`PCMonitor-Setup`**
+2. A captive portal should open automatically (or go to `http://172.16.1.1`)
+3. Enter your:
+   - WiFi network name and password
+   - OpenWeatherMap API key ([get free key here](https://openweathermap.org/api))
+   - City name (e.g., "New York", "London")
+   - Temperature units (Fahrenheit or Celsius)
+4. Click **Save & Connect** - device will reboot and connect to your WiFi
 
-1. Make sure Python 3.8+ is installed
-2. Run the build script:
-   ```
-   build_exe.bat
-   ```
-3. The EXE will be created at `dist\ESP32_PC_Stats_Feeder.exe`
+### 3. Run the PC Feeder
 
-**Optional:** Add an `app.ico` file to the project root for a custom window/tray icon.
+The feeder app sends your PC stats to the display over USB serial.
 
-## Configuration (secrets)
-Copy `include/secrets_template.h` to `include/secrets.h` and fill in your:
-- Wi-Fi SSID and password
-- OpenWeatherMap API key (free tier works)
-- City name for weather
+**Option A: Pre-built EXE** (recommended)
+Download `ESP32_PC_Stats_Feeder.exe` from releases - no Python needed.
 
-The `secrets.h` file is gitignored to keep your credentials safe.
+**Option B: Run from Python**
+```bash
+pip install -r requirements.txt
+python feeder_gui.py
+```
 
-I am no coder, but I am learning. Most of the code was reviewed by ChatGPT to get the display working, which was a pain.
+**Option C: Build your own EXE**
+```bash
+build_exe.bat
+```
 
+## Display Modes
+
+Swipe on the touch screen to navigate:
+
+| Mode | Shows |
+|------|-------|
+| **CPU** | CPU usage %, memory %, CPU temp, sparkline |
+| **GPU** | GPU usage %, GPU temp, sparkline |
+| **Disk** | Disk usage %, throughput (MB/s), free space |
+| **Weather** | Current temp, conditions, 3-day forecast |
+
+## Re-entering Setup Mode
+
+To change WiFi or weather settings after initial setup:
+
+**Long-press the screen for 3 seconds** - the device will enter setup mode and start the captive portal.
+
+Alternatively, erase all settings and start fresh:
+```bash
+pio run -t erase && pio run -t upload
+```
+
+## WiFi Web Dashboard
+
+Once connected to WiFi, the device shows its IP address on screen. Access the web dashboard:
+
+| Endpoint | Description |
+|----------|-------------|
+| `http://<ip>/` | Live HTML dashboard with all stats |
+| `http://<ip>/metrics` | JSON API for all data |
+| `http://<ip>/ip` | Plain text IP address |
+
+The web dashboard includes:
+- Real-time PC stats (CPU, GPU, Memory, Disk)
+- Weather with forecast
+- Data freshness indicator (shows if feeder is connected)
+
+## Feeder GUI Options
+
+- **Serial Port**: Select the COM port for your M5Stack
+- **GPU Selection**: Choose which GPU to monitor (multi-GPU support)
+- **Disk Scale**: Set what MB/s = 100% on the bar graph
+- **Drives**: Choose which drives to report free space for
+- **Minimize to Tray**: Run in background with system tray icon
+
+## CPU Temperature on Windows
+
+CPU temperature reading on Windows requires one of:
+- Running the feeder as **Administrator** (for WMI access)
+- Installing the optional `wmi` Python package: `pip install wmi`
+
+GPU temperature works reliably via NVIDIA drivers (NVML or nvidia-smi).
+
+## Troubleshooting
+
+**"No serial data received yet" on web dashboard**
+- Make sure the feeder GUI is running and connected to the correct COM port
+- Check that the M5Stack is connected via USB
+
+**Weather shows "--" or wrong temperature**
+- Verify your OpenWeatherMap API key is valid
+- Check city name spelling
+- Long-press to re-enter setup and verify settings
+
+**Can't connect to captive portal**
+- Make sure you're connected to the `PCMonitor-Setup` WiFi network
+- Try manually navigating to `http://172.16.1.1`
+- Some devices may need to disable mobile data temporarily
+
+## Project Structure
+
+```
+├── src/
+│   ├── main.cpp           # Main firmware (display, web server, touch)
+│   ├── config_portal.cpp  # Captive portal for WiFi/weather setup
+│   ├── weather_api.cpp    # OpenWeatherMap API client
+│   └── weather_display.cpp # Weather screen rendering
+├── include/
+│   ├── config_portal.h
+│   ├── weather_config.h
+│   └── Free_Fonts.h
+├── feeder_gui.py          # PC stats feeder with GUI
+├── platformio.ini         # PlatformIO build config
+└── requirements.txt       # Python dependencies
+```
+
+## Credits
+
+Built with M5Unified library for M5Stack Core3. Weather data from OpenWeatherMap.
