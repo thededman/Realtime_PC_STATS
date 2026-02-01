@@ -1,6 +1,5 @@
 #include <Arduino.h>
-#include <TFT_eSPI.h>
-#include <SPI.h>
+#include <M5Unified.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
@@ -8,7 +7,7 @@
 #include "Free_Fonts.h"   // Bodmer free fonts
 #include "weather_integration.h"
 
-// T-Display-S3 PC Monitor Dashboard + WiFi Web Server + Weather Mode
+// M5Stack Core3 PC Monitor Dashboard + WiFi Web Server + Weather Mode
 // - Modes: CPU, GPU, DISK, WEATHER (cycle with right/left buttons)
 // - Smooth bar animations + 60-sample sparkline
 // - Parses CSV from feeder GUI (USB serial) at 115200:
@@ -45,14 +44,13 @@ const char *WIFI_SSID = PIO_WIFI_SSID;
 const char *WIFI_PASS = PIO_WIFI_PASS;
 // ---------------------------------------------------------
 
-// TFT and full-screen sprite for flicker-free rendering
-TFT_eSPI tft;
-TFT_eSprite gfx = TFT_eSprite(&tft); // off-screen framebuffer (RGB565)
+// Full-screen sprite for flicker-free rendering (M5Unified)
+LGFX_Sprite gfx(&M5.Display); // off-screen framebuffer (RGB565)
 
-// Pins / IO (matches pin_config.h for LilyGO T-Display-S3)
-static const int PIN_LCD_POWER = 15;
-static const int BTN_BACK = 0;   // left/back (active LOW)
-static const int BTN_NEXT = 14;  // right/next (active LOW)
+// Touch swipe tracking
+int touchStartX = -1;
+bool touchActive = false;
+static const int SWIPE_THRESHOLD = 50;
 
 // Serial
 static const unsigned long BAUD = 115200;
@@ -82,12 +80,10 @@ float barTarget = 0.0f; // 0..100
 float barValue  = 0.0f; // 0..100 (displayed)
 uint32_t lastAnim = 0;
 
-// Debounce
-uint32_t lastBtnTime = 0;
 
-// Canvas (Landscape rotation)
+// Canvas (Landscape rotation - M5Stack Core3)
 static const int W = 320;
-static const int H = 170;
+static const int H = 240;
 
 // Colors
 uint16_t bg     = TFT_BLACK;
@@ -102,24 +98,37 @@ String ipText = "WiFi...";
 void setBarTargetFromMode();
 void render();
 
-// ------------------- Button helpers -------------------
-bool buttonPressed(int pin) {
-  if (digitalRead(pin) == LOW) {
-    uint32_t now = millis();
-    if (now - lastBtnTime > 220) {
-      lastBtnTime = now;
-      return true;
-    }
-  }
-  return false;
-}
-
+// ------------------- Mode navigation -------------------
 void nextMode() {
   gMode = (Mode)((gMode + 1) % 4);  // 4 modes now
 }
 
 void prevMode() {
   gMode = (Mode)((gMode + 3) % 4);  // (mode - 1 + 4) % 4
+}
+
+// ------------------- Touch swipe handling -------------------
+void handleTouch() {
+  M5.update();
+  auto touch = M5.Touch.getDetail();
+
+  if (touch.wasPressed()) {
+    touchStartX = touch.x;
+    touchActive = true;
+  }
+
+  if (touch.wasReleased() && touchActive) {
+    int deltaX = touch.x - touchStartX;
+    if (deltaX > SWIPE_THRESHOLD) {
+      prevMode();  // Swipe right = previous mode
+      setBarTargetFromMode();
+    } else if (deltaX < -SWIPE_THRESHOLD) {
+      nextMode();  // Swipe left = next mode
+      setBarTargetFromMode();
+    }
+    touchActive = false;
+    touchStartX = -1;
+  }
 }
 
 // ------------------- Animation -------------------
@@ -562,18 +571,14 @@ void wifiConnect() {
 
 // ------------------- Setup / Loop -------------------
 void setup() {
-  pinMode(PIN_LCD_POWER, OUTPUT);
-  digitalWrite(PIN_LCD_POWER, HIGH);
-
-  pinMode(BTN_BACK, INPUT_PULLUP);
-  pinMode(BTN_NEXT, INPUT_PULLUP);
+  // Initialize M5Stack Core3
+  auto cfg = M5.config();
+  M5.begin(cfg);
+  M5.Display.setRotation(1); // Landscape 320x240
 
   Serial.begin(BAUD);
 
-  tft.init();
-  tft.setRotation(1); // 320x170
-
-  // Create full-screen sprite (~ 320*170*2B = ~109 KB)
+  // Create full-screen sprite (~ 320*240*2B = ~154 KB)
   gfx.setColorDepth(16); // RGB565
   gfx.createSprite(W, H);
 
@@ -604,15 +609,8 @@ void loop() {
     server.handleClient();
   }
 
-  // Buttons
-  if (buttonPressed(BTN_NEXT)) {
-    nextMode();
-    setBarTargetFromMode();
-  }
-  if (buttonPressed(BTN_BACK)) {
-    prevMode();
-    setBarTargetFromMode();
-  }
+  // Touch swipe for mode navigation
+  handleTouch();
 
   // Serial CSV input (PC stats)
   while (Serial.available()) {

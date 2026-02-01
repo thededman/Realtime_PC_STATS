@@ -3,13 +3,12 @@
 #include <algorithm>
 #include <ctype.h>
 
-#include <TFT_eSPI.h>
+#include <M5Unified.h>
 
 #include "Free_Fonts.h"
 #include "weather_icons.h"
 
-extern TFT_eSPI tft;
-extern TFT_eSprite gfx;
+extern LGFX_Sprite gfx;
 
 namespace {
 
@@ -51,8 +50,6 @@ void WeatherDisplay::begin() {
 
 void WeatherDisplay::initializeBrightnessControl() {
   if (brightnessReady_) return;
-  ledcSetup(WEATHER_BACKLIGHT_CHANNEL, 5000, 8);
-  ledcAttachPin(WEATHER_BACKLIGHT_PIN, WEATHER_BACKLIGHT_CHANNEL);
   applyBrightness(state_.brightness);
   brightnessReady_ = true;
 }
@@ -61,7 +58,7 @@ void WeatherDisplay::applyBrightness(uint8_t level) {
   uint8_t clamped =
       std::max(WEATHER_BRIGHTNESS_MIN, std::min(WEATHER_BRIGHTNESS_MAX, level));
   state_.brightness = clamped;
-  ledcWrite(WEATHER_BACKLIGHT_CHANNEL, clamped);
+  M5.Display.setBrightness(clamped);
 }
 
 void WeatherDisplay::handleBrightnessButtons() {
