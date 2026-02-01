@@ -10,10 +10,10 @@
 extern LGFX_Sprite gfx;
 
 // Portal configuration
-static const char* AP_SSID = "M5-PCMonitor-Setup";
+static const char* AP_SSID = "PCMonitor-Setup";
 static const char* AP_PASS = "";  // Open network for easy access
-static const IPAddress AP_IP(192, 168, 4, 1);
-static const IPAddress AP_GATEWAY(192, 168, 4, 1);
+static const IPAddress AP_IP(172, 16, 1, 1);
+static const IPAddress AP_GATEWAY(172, 16, 1, 1);
 static const IPAddress AP_SUBNET(255, 255, 255, 0);
 static const byte DNS_PORT = 53;
 

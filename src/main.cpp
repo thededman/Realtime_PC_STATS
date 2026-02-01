@@ -47,6 +47,7 @@ struct Stats {
   float cpuTempF = -999, gpuTempF = -999;
   float freeC = -1, freeD = -1;
   float indoorTempF = -999;
+  uint32_t lastUpdateMs = 0;  // millis() when last serial data received
 } cur;
 
 // History buffers for sparkline (60 samples)
@@ -292,6 +293,7 @@ bool parseCSVLine(const String &line) {
   cur.freeC    = vals[7];
   cur.freeD    = vals[8];
   cur.indoorTempF = (idx >= 10) ? vals[9] : cur.cpuTempF;
+  cur.lastUpdateMs = millis();
   return true;
 }
 
@@ -415,8 +417,29 @@ const char *PAGE_INDEX = R"HTML(
         const json = await response.json();
         applyStats(json);
         applyWeather(json.weather, json.forecast);
+        // Update data status indicator
+        const statusEl = document.getElementById('dataStatus');
+        if (statusEl) {
+          const ageMs = json.dataAgeMs;
+          const uptime = json.uptimeMs;
+          if (ageMs < 0) {
+            statusEl.textContent = 'No serial data received yet (uptime: ' + Math.floor(uptime/1000) + 's)';
+            statusEl.style.color = '#f44';
+          } else if (ageMs > 10000) {
+            statusEl.textContent = 'Serial data stale: ' + Math.floor(ageMs/1000) + 's ago';
+            statusEl.style.color = '#fa0';
+          } else {
+            statusEl.textContent = 'Serial data: ' + (ageMs < 1000 ? 'live' : Math.floor(ageMs/1000) + 's ago');
+            statusEl.style.color = '#0f0';
+          }
+        }
       } catch (err) {
         console.error(err);
+        const statusEl = document.getElementById('dataStatus');
+        if (statusEl) {
+          statusEl.textContent = 'Fetch error: ' + err.message;
+          statusEl.style.color = '#f44';
+        }
       }
     }
     setInterval(refresh, 2000);
@@ -426,6 +449,9 @@ const char *PAGE_INDEX = R"HTML(
 <body>
   <main class="wrap">
     <h1>ESP32 PC Stats</h1>
+    <div class="status-bar" style="text-align:center;margin-bottom:0.8rem;font-size:0.85rem;color:#888;">
+      <span id="dataStatus">Waiting for data...</span>
+    </div>
     <div class="grid">
       <div class="card"><div class="label">CPU %</div><div id="cpu" class="value">-</div></div>
       <div class="card"><div class="label">MEM %</div><div id="mem" class="value">-</div></div>
@@ -492,6 +518,10 @@ void handleMetrics() {
   if (isnan(cur.gpuTempF) || cur.gpuTempF < -100) doc["gpuTempF"] = nullptr; else doc["gpuTempF"] = cur.gpuTempF;
   if (isnan(cur.freeC) || cur.freeC < 0) doc["freeC"] = nullptr; else doc["freeC"] = cur.freeC;
   if (isnan(cur.freeD) || cur.freeD < 0) doc["freeD"] = nullptr; else doc["freeD"] = cur.freeD;
+
+  // Include timestamp of last serial data for debugging
+  doc["dataAgeMs"] = (cur.lastUpdateMs > 0) ? (millis() - cur.lastUpdateMs) : -1;
+  doc["uptimeMs"] = millis();
 
   const WeatherData &w = display.getWeatherData();
   const WeatherDisplayState &ws = display.getDisplayState();

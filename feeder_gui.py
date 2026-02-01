@@ -25,7 +25,16 @@ try:
 except Exception:
     HAVE_NVML = False
 
-APP_TITLE = "ESP32 PC Stats Feeder"
+# Windows WMI for CPU temperature (optional)
+HAVE_WMI = False
+if os.name == 'nt':
+    try:
+        import wmi
+        HAVE_WMI = True
+    except ImportError:
+        pass
+
+APP_TITLE = "PC Stats Feeder"
 BAUD_DEFAULT = 115200
 SEND_HZ = 5                 # how many times per second to send
 SEND_INTERVAL = 1.0 / SEND_HZ
@@ -65,6 +74,27 @@ def _run_nvidia_smi_hidden(args, timeout=0.6) -> str:
 
 def _b2s(x):
     return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+
+def _get_cpu_temp_wmi() -> float:
+    """
+    Try to get CPU temperature via WMI on Windows.
+    Returns temperature in Celsius, or None if unavailable.
+    Requires running as admin for MSAcpi_ThermalZoneTemperature.
+    """
+    if not HAVE_WMI:
+        return None
+    try:
+        w = wmi.WMI(namespace="root\\wmi")
+        temps = w.MSAcpi_ThermalZoneTemperature()
+        if temps:
+            # Temperature is in tenths of Kelvin
+            kelvin_tenths = temps[0].CurrentTemperature
+            celsius = (kelvin_tenths / 10.0) - 273.15
+            if 0 < celsius < 150:  # Sanity check
+                return celsius
+    except Exception:
+        pass
+    return None
 
 def _list_gpu_names_with_index() -> list[str]:
     """
@@ -190,6 +220,7 @@ class FeederThread(threading.Thread):
                 # Temps / Free space:
                 cpu_temp_f = -999.0
                 try:
+                    # Try psutil first (works on Linux)
                     if hasattr(psutil, "sensors_temperatures"):
                         temps = psutil.sensors_temperatures(fahrenheit=False) or {}
                         for key in ("coretemp", "k10temp", "acpitz", "cpu-thermal", "nvme"):
@@ -197,6 +228,11 @@ class FeederThread(threading.Thread):
                                 c = temps[key][0].current
                                 cpu_temp_f = c * 9.0/5.0 + 32.0
                                 break
+                    # Fallback to WMI on Windows if psutil didn't work
+                    if cpu_temp_f < -100:
+                        wmi_temp = _get_cpu_temp_wmi()
+                        if wmi_temp is not None:
+                            cpu_temp_f = wmi_temp * 9.0/5.0 + 32.0
                 except Exception:
                     pass
 
